@@ -783,11 +783,15 @@ func TestEnsureCodexSandboxConfigCreatesDefaultLinux(t *testing.T) {
 	if !strings.Contains(s, `sandbox_mode = "workspace-write"`) {
 		t.Error("missing sandbox_mode")
 	}
-	if !strings.Contains(s, "[sandbox_workspace_write]") {
-		t.Error("missing [sandbox_workspace_write] section")
+	// The managed block uses TOML dotted-key form rather than a
+	// `[sandbox_workspace_write]` section header so it cannot leak into or
+	// inherit from any surrounding table scope. See upsertMulticaManagedBlock
+	// for why.
+	if strings.Contains(s, "[sandbox_workspace_write]") {
+		t.Errorf("managed block must not open a [sandbox_workspace_write] table header, got:\n%s", s)
 	}
-	if !strings.Contains(s, "network_access = true") {
-		t.Error("missing network_access = true")
+	if !strings.Contains(s, "sandbox_workspace_write.network_access = true") {
+		t.Errorf("missing dotted-key network_access = true, got:\n%s", s)
 	}
 }
 
@@ -892,6 +896,110 @@ network_access = true
 	}
 	if !strings.Contains(s, `sandbox_mode = "danger-full-access"`) {
 		t.Errorf("expected danger-full-access on macOS, got:\n%s", s)
+	}
+}
+
+func TestEnsureCodexSandboxConfigHoistsAboveUserTables(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+
+	// User config that ends inside a table. If the managed block were
+	// appended at EOF, `sandbox_mode = "..."` would be parsed as
+	// permissions.multica.sandbox_mode and Codex would never see it — see
+	// review of MUL-963 PR #1246. The block must be hoisted above any
+	// user-defined table headers so it lives at the TOML root.
+	existing := `model = "o3"
+
+[permissions.multica]
+trust = "always"
+`
+	os.WriteFile(configPath, []byte(existing), 0o644)
+
+	policy := codexSandboxPolicyFor("linux", "0.121.0")
+	if err := ensureCodexSandboxConfig(configPath, policy, "0.121.0", testLogger()); err != nil {
+		t.Fatalf("ensureCodexSandboxConfig failed: %v", err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	s := string(data)
+
+	beginIdx := strings.Index(s, multicaManagedBeginMarker)
+	endIdx := strings.Index(s, multicaManagedEndMarker)
+	tableIdx := strings.Index(s, "[permissions.multica]")
+	if beginIdx < 0 || endIdx < 0 || tableIdx < 0 {
+		t.Fatalf("expected managed block and user table to both be present, got:\n%s", s)
+	}
+	// The entire managed block must sit before the user's table header so
+	// that sandbox_mode and sandbox_workspace_write.network_access are
+	// parsed at the TOML root.
+	if !(beginIdx < endIdx && endIdx < tableIdx) {
+		t.Errorf("managed block must be hoisted above [permissions.multica]; got begin=%d end=%d table=%d:\n%s", beginIdx, endIdx, tableIdx, s)
+	}
+	// User content must be preserved verbatim.
+	if !strings.Contains(s, `model = "o3"`) {
+		t.Error("lost user top-level key")
+	}
+	if !strings.Contains(s, `trust = "always"`) {
+		t.Error("lost user permissions.multica content")
+	}
+
+	// Running again must be idempotent even when the preceding content ends
+	// inside a table.
+	if err := ensureCodexSandboxConfig(configPath, policy, "0.121.0", testLogger()); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	data2, _ := os.ReadFile(configPath)
+	if string(data2) != s {
+		t.Errorf("second pass should be idempotent:\n--- first ---\n%s\n--- second ---\n%s", s, data2)
+	}
+	if n := strings.Count(string(data2), multicaManagedBeginMarker); n != 1 {
+		t.Errorf("expected exactly one managed block after idempotent rewrite, got %d", n)
+	}
+}
+
+func TestEnsureCodexSandboxConfigMovesLegacyTrailingBlockToTop(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+
+	// Simulate a config.toml produced by the pre-fix PR #1246 logic, which
+	// appended the managed block to EOF — so the block sits below a user
+	// table. On the next daemon run, the block must be hoisted back to the
+	// top; otherwise sandbox_mode remains trapped inside the preceding table.
+	legacy := `model = "o3"
+
+[permissions.multica]
+trust = "always"
+
+` + multicaManagedBeginMarker + `
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+` + multicaManagedEndMarker + `
+`
+	os.WriteFile(configPath, []byte(legacy), 0o644)
+
+	policy := codexSandboxPolicyFor("linux", "0.121.0")
+	if err := ensureCodexSandboxConfig(configPath, policy, "0.121.0", testLogger()); err != nil {
+		t.Fatalf("ensureCodexSandboxConfig failed: %v", err)
+	}
+	data, _ := os.ReadFile(configPath)
+	s := string(data)
+
+	beginIdx := strings.Index(s, multicaManagedBeginMarker)
+	tableIdx := strings.Index(s, "[permissions.multica]")
+	if beginIdx < 0 || tableIdx < 0 || beginIdx > tableIdx {
+		t.Errorf("expected managed block to be hoisted above [permissions.multica], got:\n%s", s)
+	}
+	if strings.Count(s, multicaManagedBeginMarker) != 1 {
+		t.Errorf("expected exactly one managed block, got:\n%s", s)
+	}
+	// The old inline `[sandbox_workspace_write]` header must be gone — the
+	// new block uses dotted-key form only.
+	if strings.Contains(s, "[sandbox_workspace_write]") {
+		t.Errorf("managed block must not emit [sandbox_workspace_write] table header, got:\n%s", s)
 	}
 }
 

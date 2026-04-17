@@ -39,9 +39,15 @@ Decision matrix (see [`server/internal/daemon/execenv/codex_sandbox.go`](../serv
 
 | Host OS   | Codex version                                    | Managed block emits                                                       |
 | --------- | ------------------------------------------------ | ------------------------------------------------------------------------- |
-| non-darwin | any                                              | `sandbox_mode = "workspace-write"` + `[sandbox_workspace_write] network_access = true` |
+| non-darwin | any                                              | `sandbox_mode = "workspace-write"` + `sandbox_workspace_write.network_access = true` (dotted-key form) |
 | darwin    | ≥ `CodexDarwinNetworkAccessFixedVersion`         | same as above (upstream fix in effect)                                    |
 | darwin    | older / unknown (current default)                | `sandbox_mode = "danger-full-access"` + warn-level log                     |
+
+The managed block is always hoisted to the top of `config.toml` and uses
+TOML dotted-key syntax rather than a `[sandbox_workspace_write]` section
+header. Both are load-bearing: if the block sat after a user table like
+`[permissions.multica]`, a bare `sandbox_mode = "..."` line would be parsed
+as `permissions.multica.sandbox_mode` and Codex would silently ignore it.
 
 `CodexDarwinNetworkAccessFixedVersion` is an empty string today, meaning *no
 known fixed release yet*. Bump it once a tagged Codex release includes the

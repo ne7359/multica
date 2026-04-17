@@ -113,14 +113,27 @@ const (
 )
 
 // renderMulticaManagedBlock produces the managed block for the given policy.
+//
+// The block contains only top-level key=value assignments — no `[table]`
+// headers — and uses TOML dotted-key syntax for nested values. This is
+// important because the block is inserted into a user-owned config.toml:
+//
+//   - If the block opened a `[sandbox_workspace_write]` header, any user
+//     content that happened to sit below it would be silently reparented into
+//     that table.
+//   - If the block were appended after a file that already ends inside some
+//     other table (e.g. `[permissions.multica]`), a bare `sandbox_mode = ...`
+//     key would be parsed as a child of that preceding table.
+//
+// Keeping the block as pure top-level dotted-key assignments, and placing it
+// at the top of the file (see upsertMulticaManagedBlock), avoids both traps.
 func renderMulticaManagedBlock(policy codexSandboxPolicy) string {
 	var b strings.Builder
 	b.WriteString(multicaManagedBeginMarker)
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("sandbox_mode = %q\n", policy.Mode))
 	if policy.Mode == "workspace-write" {
-		b.WriteString("\n[sandbox_workspace_write]\n")
-		b.WriteString(fmt.Sprintf("network_access = %t\n", policy.NetworkAccess))
+		b.WriteString(fmt.Sprintf("sandbox_workspace_write.network_access = %t\n", policy.NetworkAccess))
 	}
 	b.WriteString(multicaManagedEndMarker)
 	b.WriteString("\n")
@@ -134,20 +147,26 @@ var managedBlockRe = regexp.MustCompile(
 		`.*?^` + regexp.QuoteMeta(multicaManagedEndMarker) + `\n?`)
 
 // upsertMulticaManagedBlock returns the config content with the multica-managed
-// block replaced (or appended if absent). Outside-of-markers content is left
-// untouched.
+// block placed at the very top of the file. Any previously written managed
+// block is removed in place; user content outside the markers is preserved.
+//
+// The block is always hoisted to the top (rather than replaced in place or
+// appended to EOF) so that its top-level keys are parsed at the TOML root,
+// regardless of whether the user's config ends inside a table like
+// `[permissions.multica]` or `[profiles.foo]`. Combined with the dotted-key
+// form used by renderMulticaManagedBlock, this means the managed block neither
+// leaks into nor inherits from any surrounding table scope.
 func upsertMulticaManagedBlock(content string, policy codexSandboxPolicy) string {
+	// Drop any previously written managed block (wherever it sits).
+	content = managedBlockRe.ReplaceAllString(content, "")
 	block := renderMulticaManagedBlock(policy)
-	if managedBlockRe.MatchString(content) {
-		return managedBlockRe.ReplaceAllString(content, block)
+	// Trim leading blank lines left behind by the removal so we don't grow
+	// the file on every idempotent rewrite.
+	content = strings.TrimLeft(content, "\n")
+	if content == "" {
+		return block
 	}
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	if content != "" {
-		content += "\n"
-	}
-	return content + block
+	return block + "\n" + content
 }
 
 // stripLegacySandboxDirectives removes top-level `sandbox_mode = ...` lines
